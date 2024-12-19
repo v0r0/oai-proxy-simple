@@ -34,8 +34,10 @@ async def chat_completions(request: Request):
                     response.raise_for_status()
 
                     async def stream_generator():
-                        async for line in response.aiter_lines():
-                            yield line
+                        async for chunk in response.aiter_lines():
+                            if chunk.strip():
+                                yield chunk
+
                     return StreamingResponse(stream_generator(), media_type="text/event-stream")
             else:
                 response = await client.post(
