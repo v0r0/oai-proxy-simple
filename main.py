@@ -1,59 +1,74 @@
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 import httpx
+import json
 
 app = FastAPI()
 
-OPENAI_BASE_URL = "https://api.openai.com"
+UPSTREAM_API_URL = "https://api.openai.com/v1/chat/completions"
+
 
 @app.post("/v1/chat/completions")
-async def chat_completions(request: Request):
-    try:
-        body = await request.json()
+async def proxy_response(request: Request, authorization: str = Header(...)):
+    headers = {
+        "Authorization": authorization,
+        "Content-Type": "text/event-stream",
+    }
 
-        auth_header = request.headers.get("Authorization")
-        if not auth_header or not auth_header.startswith("Bearer "):
-            raise HTTPException(status_code=400, detail="Missing or invalid Authorization header.")
-        user_api_key = auth_header.split(" ", 1)[1]
+    payload = await request.json()
+    print(payload)
 
-        is_streaming = body.get("stream", False)
+    if 'model' not in payload:
+        raise HTTPException(status_code=400, detail="Model parameter is required")
+    
+    if 'messages' not in payload:
+        raise HTTPException(status_code=400, detail="Messages parameter is required")
 
-        headers = {
-            "Authorization": f"Bearer {user_api_key}",
-            "Content-Type": "application/json"
-        }
-        
-        async with httpx.AsyncClient() as client:
-            if is_streaming:
-                async with client.stream(
-                    "POST",
-                    f"{OPENAI_BASE_URL}/v1/chat/completions",
-                    headers=headers,
-                    json=body
-                ) as response:
-                    response.raise_for_status()
+    stream = payload.get("stream", False)
 
-                    async def stream_generator():
+    payload = {
+        'model': payload['model'],
+        'messages': payload['messages'],
+        'max_tokens': payload.get('max_tokens', 4000),
+        'temperature': payload.get('temperature', 0.7),
+        'top_p': payload.get('top_p', 1),
+        'stream': stream
+    }
+
+    if stream:
+        async def stream_generator():
+            async with httpx.AsyncClient(timeout=None) as client:
+                try:
+                    async with client.stream("POST", UPSTREAM_API_URL, headers=headers, json=payload) as response:
+                        if response.status_code != 201 and response.status_code != 200:
+                            error_detail = await response.aread()
+                            yield f"data: {json.dumps({'error': error_detail.decode('utf-8')})}\n\n"
+                            return
                         async for chunk in response.aiter_lines():
-                            if chunk.strip():
-                                yield chunk
+                            print(chunk)
+                            yield f"{chunk}\n" 
+                except httpx.RequestError as exc:
+                    yield f"data: {json.dumps({'error': str(exc)})}\n\n"
 
-                    return StreamingResponse(stream_generator(), media_type="text/event-stream")
-            else:
-                response = await client.post(
-                    f"{OPENAI_BASE_URL}/v1/chat/completions",
-                    headers=headers,
-                    json=body
-                )
-                response.raise_for_status()
+        return StreamingResponse(stream_generator(), media_type="text/event-stream")
+
+    else:
+        async with httpx.AsyncClient(timeout=None) as client:
+            try:
+                response = await client.post(UPSTREAM_API_URL, headers=headers, json=payload)
+                if response.status_code != 200:
+                    raise HTTPException(
+                        status_code=response.status_code,
+                        detail=response.text,
+                    )
                 return JSONResponse(content=response.json(), status_code=response.status_code)
+            except httpx.RequestError as exc:
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Error communicating with the upstream API: {str(exc)}",
+                )
 
-    except httpx.HTTPError as e:
-        raise HTTPException(status_code=500, detail=f"Error communicating with OpenAI: {str(e)}")
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=80)
+    uvicorn.run(app, host="0.0.0.0", port=80)
